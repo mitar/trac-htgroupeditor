@@ -25,9 +25,10 @@ from trac.core import *
 from trac.util import translation
 from trac.admin.api import IAdminPanelProvider
 from trac.web.chrome import ITemplateProvider, add_stylesheet
+from trac.perm import IPermissionGroupProvider
 
 class GroupsEditorPlugin(Component):
-    implements(IAdminPanelProvider, ITemplateProvider)
+    implements(IAdminPanelProvider, ITemplateProvider, IPermissionGroupProvider)
 
     def __init__(self):
         self.account_manager = AccountManager(self.env)
@@ -38,8 +39,21 @@ class GroupsEditorPlugin(Component):
         return [resource_filename(__name__, 'templates')]
 
     def get_htdocs_dirs(self):
-        return [('ge', resource_filename(__name__, 'htdocs'))]
+        return []
 
+    # IPermissionGroupProvider methdos
+    def get_permission_groups(self, username):
+        """Return a list of names of the groups that the user with the specified
+        name is a member of."""
+
+        groups_list = []
+        groups_dict = self._get_groups_and_members() or {}
+
+        for group,usernames in groups_dict.items():
+            if username in usernames:
+                groups_list.append(group)
+        
+        return groups_list
 
     # IAdminPanelProvider methods
     def get_admin_panels(self, req):
@@ -115,8 +129,14 @@ class GroupsEditorPlugin(Component):
         """
         Check if the fine grained permission system is installed
         """
-        return (self.config.get('components', 'authzpolicy.authz_policy.authzpolicy') == 'enabled')
+        return (self.config.getbool('components', 'authzpolicy.authz_policy.authzpolicy') or
+                self.config.getbool('components', 'authz_policy.authzpolicy') )
 
+    def _check_for_svnauthz(self):
+        """
+        Check if the SVN Authz Plugin is installed
+        """
+        return self.config.getbool('components','svnauthz.svnauthz.svnauthzplugin')
 
     def _update_fine_grained(self, group_details):
         #import ConfigObj
@@ -127,6 +147,14 @@ class GroupsEditorPlugin(Component):
             authz_policy_dict['groups'] = group_details
         authz_policy_dict.write()
 
+    def _update_svnauthz(self, group_details):
+        svnauthz_policy_file_name = self._get_filename('trac','authz_file')
+        svnauthz_policy_dict = ConfigObj(svnauthz_policy_file_name)
+        # If there isn't a group file, don't destroy the existing entries
+        if (group_details):
+            svnauthz_policy_dict['groups'] = group_details
+        svnauthz_policy_dict.write()
+        
 
     def render_admin_panel(self, req, cat, page, path_info):
         """
@@ -142,14 +170,73 @@ class GroupsEditorPlugin(Component):
         page_args = {}
 
         group_details = self._get_groups_and_members()
-        groups_list = group_details.keys()
+        
+        # This option needs to be set if the admin can add and delete groups
+        # usage in trac.ini:
+        # [htgroupedit]
+        # allowgroupedit = enabled
+        allowgroupedit = self.config.getbool("htgroupeditor","allowgroupedit")
+
         # For ease of understanding and future reading
         # being done in the ORDER displayed.
         if not req.method == 'POST':
-            page_args['groups_list'] = [''] + groups_list
+            groups_list = [''];
+            if group_details is not None:
+               groups_list = groups_list + group_details.keys()
+
+            page_args['groups_list'] = groups_list
+            page_args['allowgroupedit'] = allowgroupedit
+
             return 'htgroupeditor.html', page_args
         else:
-            group_name = str(req.args.get('group_name'))
+            if req.args.get('new_group') and group_details is None:
+                # It can only happen for new_group, that group_details is None
+                groups_list = []
+                group_details = {}
+            else:
+                groups_list = group_details.keys()
+            
+            if req.args.get('new_group') and allowgroupedit:
+                # Create new group and select it
+                if not req.args.get('new_group_name') or len(str(req.args.get('new_group_name')).strip()) == 0:
+                    raise TracError("Group name was empty")
+                
+                group_name = str(req.args.get('new_group_name')).strip()
+                if group_name in group_details.keys():
+                    raise TracError("Group already exists")
+                
+                group_details[group_name] = []
+                groups_list.append(group_name)
+            elif req.args.get('delete_group') and allowgroupedit:
+                # Deleting a group involves removing it from list and details
+                delete_group_name = str(req.args.get('group_name')).strip()
+                if not delete_group_name in groups_list:
+                    raise TracError("Invalid group for deletion")
+                
+                del group_details[delete_group_name]
+                groups_list.remove(delete_group_name)
+                
+                if len(groups_list) == 0:
+                    # In case that was the last group, the subsequent won't work
+                    # Thus we have to do the writing of files here and return the empty page
+                    self._write_groups_file(group_details)
+                    if req.args.get('finegrained_check'):
+                        self._update_fine_grained(group_details)
+                    if req.args.get('svnauthz_check'):
+                        self._update_svnauthz(group_details)
+                    
+                    # Finally send the empty page
+                    page_args['groups_list'] = ['']
+                    page_args['allowgroupedit'] = allowgroupedit
+
+                    return 'htgroupeditor.html', page_args
+                
+                # Select first group in list
+                group_name = groups_list[0]
+            else:
+                # Select group based on the request
+                group_name = str(req.args.get('group_name'))
+            
             # put the selected entry at the top of the list
             groups_list.remove(group_name)
             groups_list.insert(0, group_name)
@@ -158,7 +245,7 @@ class GroupsEditorPlugin(Component):
             for name in group_details[group_name]:
                 if name not in users_list:
                     users_list.append(name)
-            group_details[group_name] = users_list
+            group_details[group_name] = sorted(users_list)
 
             if req.args.get('deletions'):
                 deletions = req.args.get('deletions')
@@ -180,25 +267,30 @@ class GroupsEditorPlugin(Component):
                         group_details[group_name].append(name)
 
             # get the list of users not in the group
-            addable_usernames = ['']
+            addable_usernames = []
             for username in self.account_manager.get_users():
                 username = username.strip()
                 if len(username) and not username in group_details[group_name]:
                     addable_usernames.append(username)   
 
             group_details[group_name].sort()
+            addable_usernames.sort()
 
             page_args['groups_list'] = groups_list
             page_args['users_list'] = group_details[group_name]
             page_args['addable_usernames'] = addable_usernames
             page_args['group_name'] = group_name
             page_args['finegrained'] = self._check_for_finegrained()
+            page_args['svnauthz'] = self._check_for_svnauthz()
+            page_args['allowgroupedit'] = allowgroupedit
 
-            if req.args.get('apply_changes'):
+            if req.args.get('apply_changes') or req.args.get('new_group') or req.args.get('delete_group'):
                 self._write_groups_file(group_details)
                 # update the fine grained permissions, if it is installed    
                 if req.args.get('finegrained_check'):
                     self._update_fine_grained(group_details)
+                if req.args.get('svnauthz_check'):
+                    self._update_svnauthz(group_details)
 
             return 'htgroupeditor.html', page_args
 
