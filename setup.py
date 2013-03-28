@@ -7,7 +7,7 @@ from setuptools import find_packages, setup
 
 setup(
     name='TracHtGroupEditorPlugin',
-    version='2.0',
+    version='2.0.1',
     author = 'Robert Martin',
     author_email = 'robert.martin@arqiva.com',
     description = 'HT Group Editor plugin for Trac',
