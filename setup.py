@@ -18,6 +18,7 @@ setup(
         'trac.plugins' : ['HtGroupEditor = htgroupeditor']
     },
     package_data={'htgroupeditor':['templates/*.html']},
+    include_package_data = True,
     install_requires = ['Trac >=0.11', 'configobj'],
 )
 
